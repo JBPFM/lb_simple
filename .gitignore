@@ -1,0 +1,5 @@
+/target
+.cache
+.clangd
+compile_commands.json
+.spec-workflow
