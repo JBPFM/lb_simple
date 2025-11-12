@@ -38,4 +38,14 @@
  * };
  */
 
+/* Futex 事件数据结构 */
+struct futex_event {
+	u64 timestamp;
+	u32 pid;
+	u32 tid;
+	u64 uaddr;
+	u32 op;
+	u32 val;
+};
+
 #endif /* __INTF_H */

@@ -20,8 +20,8 @@
  * Copyright (c) 2022 Tejun Heo <tj@kernel.org>
  * Copyright (c) 2022 David Vernet <dvernet@meta.com>
  */
-#include <scx/common.bpf.h>
 #include "intf.h"
+#include <scx/common.bpf.h>
 
 char _license[] SEC("license") = "GPL";
 
@@ -39,115 +39,123 @@ UEI_DEFINE(uei);
  */
 #define SHARED_DSQ 0
 
+// lock_addr -> last_run_cpu
 struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(key_size, sizeof(u32));
-	__uint(value_size, sizeof(u64));
-	__uint(max_entries, 2);			/* [local, global] */
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __type(key, u64);   /* lock_addr */
+  __type(value, u32); /* last_run_cpu */
+  __uint(max_entries, 10000);
+} lock_owners SEC(".maps");
+
+// tid -> lock_addr
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __type(key, u32);   /* tid */
+  __type(value, u64); /* lock_addr */
+  __uint(max_entries, 10000);
+} thread_stats SEC(".maps");
+
+// 统计信息
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __type(key, u32);
+  __type(value, u64);
+  __uint(max_entries, 2); /* [futex_wait_count, futex_wake_count] */
 } stats SEC(".maps");
 
-static void stat_inc(u32 idx)
-{
-	u64 *cnt_p = bpf_map_lookup_elem(&stats, &idx);
-	if (cnt_p)
-		(*cnt_p)++;
+static void stat_inc(u32 idx) {
+  u64 *cnt_p = bpf_map_lookup_elem(&stats, &idx);
+  if (cnt_p)
+    (*cnt_p)++;
 }
 
-s32 BPF_STRUCT_OPS(lb_simple_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
-{
-	return 0;
-	bool is_idle = false;
-	s32 cpu;
-
-	cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
-	if (is_idle) {
-		stat_inc(0);	/* count local queueing */
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
-	}
-
-	return cpu;
+// 查询thread_stats中的lock_addr，返回指针以区分"未找到"和"值为0"
+static inline u64 *get_lock_addr_ptr(u32 tid) {
+  return bpf_map_lookup_elem(&thread_stats, &tid);
 }
 
-void BPF_STRUCT_OPS(lb_simple_enqueue, struct task_struct *p, u64 enq_flags)
-{
-	stat_inc(1);	/* count global queueing */
-
-	if (fifo_sched) {
-		scx_bpf_dsq_insert(p, SHARED_DSQ, SCX_SLICE_DFL, enq_flags);
-	} else {
-		u64 vtime = p->scx.dsq_vtime;
-
-		/*
-		 * Limit the amount of budget that an idling task can accumulate
-		 * to one slice.
-		 */
-		if (time_before(vtime, vtime_now - SCX_SLICE_DFL))
-			vtime = vtime_now - SCX_SLICE_DFL;
-
-		scx_bpf_dsq_insert_vtime(p, SHARED_DSQ, SCX_SLICE_DFL, vtime,
-					 enq_flags);
-	}
+// 查询lock_owners中的last_run_cpu，返回指针以区分"未找到"和"值为0"
+static inline u32 *get_last_run_cpu_ptr(u64 lock_addr) {
+  return bpf_map_lookup_elem(&lock_owners, &lock_addr);
 }
 
-void BPF_STRUCT_OPS(lb_simple_dispatch, s32 cpu, struct task_struct *prev)
-{
-	scx_bpf_dsq_move_to_local(SHARED_DSQ);
+s32 BPF_STRUCT_OPS(lb_simple_select_cpu, struct task_struct *p, s32 prev_cpu,
+                   u64 wake_flags) {
+  bool is_idle = false;
+  s32 cpu;
+  u32 tid = p->pid;
+  u64 *lock_addr_p;
+  u32 *target_cpu_p;
+
+  /* 查询当前线程是否持有锁 */
+  lock_addr_p = get_lock_addr_ptr(tid);
+
+  if (lock_addr_p) {
+    /* 线程持有锁，查询锁的 last_run_cpu */
+    target_cpu_p = get_last_run_cpu_ptr(*lock_addr_p);
+	// 
+    if (target_cpu_p) {
+      u32 target_cpu = *target_cpu_p;
+
+      /* 验证 target_cpu 是否在允许的 CPU 集合中 */
+      if (bpf_cpumask_test_cpu(target_cpu, p->cpus_ptr)) {
+        /* 检查 CPU 是否空闲 */
+        scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | target_cpu, SCX_SLICE_DFL, 0);
+        return target_cpu;
+        /* CPU 不空闲，但仍然倾向于使用它（通过返回它作为建议） */
+        /* 任务会进入 enqueue，最终可能在该 CPU 上运行 */
+      }
+    }
+  }
+
+  /* 没有锁或无法使用 last_run_cpu，使用默认策略 */
+  cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+  if (is_idle) {
+    scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+  }
+
+  return cpu;
 }
 
-void BPF_STRUCT_OPS(lb_simple_running, struct task_struct *p)
-{
-	if (fifo_sched)
-		return;
-
-	/*
-	 * Global vtime always progresses forward as tasks start executing. The
-	 * test and update can be performed concurrently from multiple CPUs and
-	 * thus racy. Any error should be contained and temporary. Let's just
-	 * live with it.
-	 */
-	if (time_before(vtime_now, p->scx.dsq_vtime))
-		vtime_now = p->scx.dsq_vtime;
+s32 BPF_STRUCT_OPS_SLEEPABLE(lb_simple_init) {
+  return scx_bpf_create_dsq(SHARED_DSQ, -1);
 }
 
-void BPF_STRUCT_OPS(lb_simple_stopping, struct task_struct *p, bool runnable)
-{
-	if (fifo_sched)
-		return;
-
-	/*
-	 * Scale the execution time by the inverse of the weight and charge.
-	 *
-	 * Note that the default yield implementation yields by setting
-	 * @p->scx.slice to zero and the following would treat the yielding task
-	 * as if it has consumed all its slice. If this penalizes yielding tasks
-	 * too much, determine the execution time by taking explicit timestamps
-	 * instead of depending on @p->scx.slice.
-	 */
-	p->scx.dsq_vtime += (SCX_SLICE_DFL - p->scx.slice) * 100 / p->scx.weight;
+void BPF_STRUCT_OPS(lb_simple_exit, struct scx_exit_info *ei) {
+  UEI_RECORD(uei, ei);
 }
 
-void BPF_STRUCT_OPS(lb_simple_enable, struct task_struct *p)
-{
-	p->scx.dsq_vtime = vtime_now;
+/* Tracepoint: sys_enter_futex - 捕获 futex wait 和 wake 操作 */
+SEC("tp/syscalls/sys_enter_futex")
+int trace_futex(struct trace_event_raw_sys_enter *ctx) {
+  u64 pid_tgid = bpf_get_current_pid_tgid();
+  u32 tid = (u32)pid_tgid;
+  u32 op;
+  u64 lock_addr;
+
+  /* 读取 futex 操作类型（第二个参数） */
+  bpf_probe_read_kernel(&op, sizeof(op), &ctx->args[1]);
+
+  /* 获取 futex 地址（锁地址） */
+  lock_addr = ctx->args[0];
+
+  /* 提取操作类型（低 7 位） */
+  u32 futex_op = op & 0x7f;
+
+  if (futex_op == 0) {
+    /* FUTEX_WAIT: 记录 tid -> lock_addr 映射 */
+    bpf_map_update_elem(&thread_stats, &tid, &lock_addr, BPF_ANY);
+    stat_inc(0); /* futex_wait 计数 */
+  } else if (futex_op == 1) {
+    /* FUTEX_WAKE: 记录 lock_addr -> last_run_cpu 映射 */
+    u32 cpu = bpf_get_smp_processor_id();
+    bpf_map_update_elem(&lock_owners, &lock_addr, &cpu, BPF_ANY);
+    stat_inc(1); /* futex_wake 计数 */
+  }
+
+  return 0;
 }
 
-s32 BPF_STRUCT_OPS_SLEEPABLE(lb_simple_init)
-{
-	return scx_bpf_create_dsq(SHARED_DSQ, -1);
-}
-
-void BPF_STRUCT_OPS(lb_simple_exit, struct scx_exit_info *ei)
-{
-	UEI_RECORD(uei, ei);
-}
-
-SCX_OPS_DEFINE(lb_simple_ops,
-	       .select_cpu		= (void *)lb_simple_select_cpu,
-	       .enqueue			= (void *)lb_simple_enqueue,
-	       .dispatch		= (void *)lb_simple_dispatch,
-	       .running			= (void *)lb_simple_running,
-	       .stopping		= (void *)lb_simple_stopping,
-	       .enable			= (void *)lb_simple_enable,
-	       .init			= (void *)lb_simple_init,
-	       .exit			= (void *)lb_simple_exit,
-	       .name			= "lb_simple");
+SCX_OPS_DEFINE(lb_simple_ops, .select_cpu = (void *)lb_simple_select_cpu,
+               .init = (void *)lb_simple_init, .exit = (void *)lb_simple_exit,
+               .name = "lb_simple");
