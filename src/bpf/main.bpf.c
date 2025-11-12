@@ -20,14 +20,12 @@
  * Copyright (c) 2022 Tejun Heo <tj@kernel.org>
  * Copyright (c) 2022 David Vernet <dvernet@meta.com>
  */
-#include "intf.h"
 #include <scx/common.bpf.h>
 
 char _license[] SEC("license") = "GPL";
 
 const volatile bool fifo_sched;
 
-static u64 vtime_now;
 UEI_DEFINE(uei);
 
 /*
@@ -89,6 +87,9 @@ s32 BPF_STRUCT_OPS(lb_simple_select_cpu, struct task_struct *p, s32 prev_cpu,
 
   /* 查询当前线程是否持有锁 */
   lock_addr_p = get_lock_addr_ptr(tid);
+
+  /* 删除 thread_stats 中当前 tid 的表项 */
+  bpf_map_delete_elem(&thread_stats, &tid);
 
   if (lock_addr_p) {
     /* 线程持有锁，查询锁的 last_run_cpu */
