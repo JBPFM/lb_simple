@@ -1,40 +1,12 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/*
- * A simple scheduler.
- *
- * By default, it operates as a simple global weighted vtime scheduler and can
- * be switched to FIFO scheduling. It also demonstrates the following niceties.
- *
- * - Statistics tracking how many tasks are queued to local and global dsq's.
- * - Termination notification for userspace.
- *
- * While very simple, this scheduler should work reasonably well on CPUs with a
- * uniform L3 cache topology. While preemption is not implemented, the fact that
- * the scheduling queue is shared across all CPUs means that whatever is at the
- * front of the queue is likely to be executed fairly quickly given enough
- * number of CPUs. The FIFO scheduling mode may be beneficial to some workloads
- * but comes with the usual problems with FIFO scheduling where saturating
- * threads can easily drown out interactive ones.
- *
- * Copyright (c) 2022 Meta Platforms, Inc. and affiliates.
- * Copyright (c) 2022 Tejun Heo <tj@kernel.org>
- * Copyright (c) 2022 David Vernet <dvernet@meta.com>
- */
 #include <scx/common.bpf.h>
 
 char _license[] SEC("license") = "GPL";
 
-const volatile bool fifo_sched;
+const volatile bool use_cgroup_filter;
 
 UEI_DEFINE(uei);
 
-/*
- * Built-in DSQs such as SCX_DSQ_GLOBAL cannot be used as priority queues
- * (meaning, cannot be dispatched to with scx_bpf_dsq_insert_vtime()). We
- * therefore create a separate DSQ with ID 0 that we dispatch to and consume
- * from. If lb_simple only supported global FIFO scheduling, then we could just
- * use SCX_DSQ_GLOBAL.
- */
 #define SHARED_DSQ 0
 
 // lock_addr -> last_run_cpu
@@ -60,6 +32,14 @@ struct {
   __type(value, u64);
   __uint(max_entries, 2); /* [futex_wait_count, futex_wake_count] */
 } stats SEC(".maps");
+
+// 允许用户空间限制监测的 cgroup
+struct {
+  __uint(type, BPF_MAP_TYPE_CGROUP_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, u32);
+  __type(value, u32);
+} cgroup_filter SEC(".maps");
 
 static void stat_inc(u32 idx) {
   u64 *cnt_p = bpf_map_lookup_elem(&stats, &idx);
@@ -94,7 +74,6 @@ s32 BPF_STRUCT_OPS(lb_simple_select_cpu, struct task_struct *p, s32 prev_cpu,
   if (lock_addr_p) {
     /* 线程持有锁，查询锁的 last_run_cpu */
     target_cpu_p = get_last_run_cpu_ptr(*lock_addr_p);
-	// 
     if (target_cpu_p) {
       u32 target_cpu = *target_cpu_p;
 
@@ -133,6 +112,10 @@ int trace_futex(struct trace_event_raw_sys_enter *ctx) {
   u32 tid = (u32)pid_tgid;
   u32 op;
   u64 lock_addr;
+  u32 idx = 0;
+
+  if (use_cgroup_filter && !bpf_current_task_under_cgroup(&cgroup_filter, idx))
+    return 0;
 
   /* 读取 futex 操作类型（第二个参数） */
   bpf_probe_read_kernel(&op, sizeof(op), &ctx->args[1]);

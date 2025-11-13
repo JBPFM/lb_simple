@@ -16,6 +16,7 @@ scx_stats_derive = {version = "1.0.17" }
 scx_utils = {version = "1.0.22", features = ["autopower"] }
 serde = { version = "1.0.215", features = ["derive"] }
 simplelog = "0.12"
+libc = "0.2.177"
 
 [build-dependencies]
 scx_cargo = { version = "1.0.22" }
