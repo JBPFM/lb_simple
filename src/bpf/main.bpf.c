@@ -3,7 +3,7 @@
 
 char _license[] SEC("license") = "GPL";
 
-const volatile bool use_cgroup_filter;
+const volatile pid_t pid_filter;
 
 UEI_DEFINE(uei);
 
@@ -32,14 +32,6 @@ struct {
   __type(value, u64);
   __uint(max_entries, 2); /* [futex_wait_count, futex_wake_count] */
 } stats SEC(".maps");
-
-// 允许用户空间限制监测的 cgroup
-struct {
-  __uint(type, BPF_MAP_TYPE_CGROUP_ARRAY);
-  __uint(max_entries, 1);
-  __type(key, u32);
-  __type(value, u32);
-} cgroup_filter SEC(".maps");
 
 static void stat_inc(u32 idx) {
   u64 *cnt_p = bpf_map_lookup_elem(&stats, &idx);
@@ -110,11 +102,12 @@ SEC("tp/syscalls/sys_enter_futex")
 int trace_futex(struct trace_event_raw_sys_enter *ctx) {
   u64 pid_tgid = bpf_get_current_pid_tgid();
   u32 tid = (u32)pid_tgid;
+  u32 pid = pid_tgid >> 32;
   u32 op;
   u64 lock_addr;
-  u32 idx = 0;
 
-  if (use_cgroup_filter && !bpf_current_task_under_cgroup(&cgroup_filter, idx))
+  /* 如果设置了 pid_filter，只监测指定的进程 */
+  if (pid_filter != 0 && pid != pid_filter)
     return 0;
 
   /* 读取 futex 操作类型（第二个参数） */
