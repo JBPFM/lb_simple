@@ -205,6 +205,14 @@ fn main() -> Result<()> {
     // Parse command line arguments
     let opts = Opts::parse();
 
+    // 参数约束：必须输入二进制文件和参数
+    if opts.command.is_empty() {
+        eprintln!("错误：必须指定要运行的二进制文件和参数");
+        eprintln!("用法: {} [选项] -- <命令> [参数...]", std::env::args().next().unwrap_or_else(|| "lb_simple".to_string()));
+        eprintln!("示例: {} -- /bin/ls -la", std::env::args().next().unwrap_or_else(|| "lb_simple".to_string()));
+        std::process::exit(1);
+    }
+
     // Initialize logger
     let log_level = if opts.debug {
         simplelog::LevelFilter::Debug
@@ -229,12 +237,7 @@ fn main() -> Result<()> {
     })
     .context("Failed to set Ctrl-C handler")?;
 
-    let child = if !opts.command.is_empty() {
-        Some(ChildProcess::spawn_suspended(&opts.command)?)
-    } else {
-        None
-    };
-
+    let child = Some(ChildProcess::spawn_suspended(&opts.command)?);
     let child_pid = child.map(|c| c.pid);
 
     // Allocate open_object for the lifetime of the scheduler
@@ -243,18 +246,11 @@ fn main() -> Result<()> {
     // Initialize and run the scheduler
     let _sched = Scheduler::init(opts, child_pid, &mut open_object)?;
 
-    if let Some(child) = child {
-        child.resume()?;
-        // Wait for child process to complete, then exit
-        child.wait()?;
-        info!("Child process completed, exiting scheduler");
-    } else {
-        // No child process, wait for Ctrl-C
-        while !shutdown.load(Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        }
-        info!("Received shutdown signal");
-    }
+    // Resume and wait for child process
+    let child = child.unwrap(); // Safe because we checked command is not empty
+    child.resume()?;
+    child.wait()?;
+    info!("Child process completed, exiting scheduler");
     
     Ok(())
 }
