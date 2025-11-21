@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+#include "vmlinux.h"
 #include <scx/common.bpf.h>
 
 char _license[] SEC("license") = "GPL";
@@ -27,7 +28,7 @@ struct {
 
 // 统计信息
 struct {
-  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
   __type(key, u32);
   __type(value, u64);
   __uint(max_entries, 2); /* [futex_wait_count, futex_wake_count] */
