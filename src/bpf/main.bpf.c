@@ -82,8 +82,11 @@ s32 BPF_STRUCT_OPS(lb_simple_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 dfl:
   cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
-  if (is_idle)
+  if (concurrency_mode == 2) {
+    scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL, 0);
+  } else if (is_idle) {
     scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+  }
 
   return cpu;
 }
