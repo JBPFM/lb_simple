@@ -18,6 +18,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
 use clap::Parser;
+use clap::ValueEnum;
 use libbpf_rs::Link;
 use libbpf_rs::OpenObject;
 use libc::pid_t;
@@ -27,6 +28,17 @@ use scx_utils::scx_ops_load;
 use scx_utils::scx_ops_open;
 
 const SCHEDULER_NAME: &str = "lb_simple";
+
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ConcurrencyMode {
+    /// Use default scx CPU selection logic
+    Default = 0,
+    /// Only schedule within the current NUMA node
+    Numa = 1,
+    /// Only schedule on the previous CPU (ignore busy/idle)
+    LastCpu = 2,
+}
 
 /// lb_simple: A simple global weighted vtime scheduler
 #[derive(Debug, Parser, Clone)]
@@ -43,6 +55,10 @@ struct Opts {
     /// Enable debug output
     #[clap(short = 'd', long, action = clap::ArgAction::SetTrue)]
     debug: bool,
+
+    /// Reduce concurrency by restricting CPU placement
+    #[clap(long, value_enum, default_value_t = ConcurrencyMode::Default)]
+    concurrency_mode: ConcurrencyMode,
 
     /// Optional command to launch (use -- to separate)
     #[clap(value_name = "CMD", last = true)]
@@ -65,6 +81,7 @@ impl Scheduler {
         // Set BPF variables before loading
         if let Some(rodata) = &mut skel.maps.rodata_data {
             rodata.pid_filter = child_pid.unwrap_or(0);
+            rodata.concurrency_mode = opts.concurrency_mode as u32;
         }
 
         // Load the BPF program

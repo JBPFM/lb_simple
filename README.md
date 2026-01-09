@@ -70,6 +70,7 @@ sudo ./target/release/lb_simple -- <命令> [参数...]
 - `-v, --verbose` - 启用详细输出，包括周期性统计信息
 - `-i, --interval <秒>` - 每隔指定秒数打印调度器统计信息（默认：2秒）
 - `-d, --debug` - 启用调试输出
+- `--concurrency-mode <default|numa|last-cpu>` - 通过限制 CPU 放置来降低并发度
 - `--` - 分隔符，后面跟要运行的命令和参数
 
 ### 使用示例
