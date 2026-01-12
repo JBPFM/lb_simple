@@ -12,6 +12,8 @@ use std::sync::OnceLock;
 
 use anyhow::Result;
 use libbpf_rs::Link;
+use libbpf_rs::MapCore;
+use libbpf_rs::MapHandle;
 use libbpf_rs::OpenObject;
 use log::info;
 use scx_utils::scx_ops_attach;
@@ -22,6 +24,9 @@ const SCHEDULER_NAME: &str = "lb_simple";
 
 // 全局状态，保持 eBPF 程序和 OpenObject 的生命周期
 static SCHEDULER_STATE: OnceLock<SchedulerState> = OnceLock::new();
+
+// 全局 held_locks map handle，供 mutex_hook 使用
+pub(crate) static HELD_LOCKS_MAP: OnceLock<MapHandle> = OnceLock::new();
 
 struct SchedulerState {
     _link: Link,
@@ -37,7 +42,8 @@ fn init_scheduler(debug: bool) -> Result<SchedulerState> {
     skel_builder.obj_builder.debug(debug);
 
     // 使用 Box::leak 来保持 OpenObject 的生命周期
-    let open_object: &'static mut MaybeUninit<OpenObject> = Box::leak(Box::new(MaybeUninit::uninit()));
+    let open_object: &'static mut MaybeUninit<OpenObject> =
+        Box::leak(Box::new(MaybeUninit::uninit()));
 
     // Open the BPF skeleton
     let mut skel = scx_ops_open!(skel_builder, open_object, lb_simple_ops, None)?;
@@ -52,6 +58,10 @@ fn init_scheduler(debug: bool) -> Result<SchedulerState> {
 
     // Attach the scheduler
     let _link = scx_ops_attach!(skel, lb_simple_ops)?;
+
+    let held_locks_map_id = skel.maps.held_locks.info()?.info.id;
+    let held_locks_handle = MapHandle::from_map_id(held_locks_map_id)?;
+    let _ = HELD_LOCKS_MAP.set(held_locks_handle);
 
     info!("{SCHEDULER_NAME} scheduler started via LD_PRELOAD");
     Ok(SchedulerState { _link })
@@ -74,16 +84,14 @@ fn init_ebpf() {
     );
 
     // 初始化调度器（只执行一次）
-    let _ = SCHEDULER_STATE.get_or_init(|| {
-        match init_scheduler(false) {
-            Ok(state) => {
-                eprintln!("[lb_simple] eBPF scheduler loaded successfully");
-                state
-            }
-            Err(e) => {
-                eprintln!("[lb_simple] Failed to load eBPF scheduler: {}", e);
-                panic!("eBPF initialization failed");
-            }
+    let _ = SCHEDULER_STATE.get_or_init(|| match init_scheduler(false) {
+        Ok(state) => {
+            eprintln!("[lb_simple] eBPF scheduler loaded successfully");
+            state
+        }
+        Err(e) => {
+            eprintln!("[lb_simple] Failed to load eBPF scheduler: {}", e);
+            panic!("eBPF initialization failed");
         }
     });
 }
