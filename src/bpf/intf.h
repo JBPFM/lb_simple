@@ -20,6 +20,10 @@ struct slice_track_info {
     unsigned char pad[7];
 };
 
+struct user_lock_state {
+    unsigned int depth;
+};
+
 enum stat_idx {
     STAT_FUTEX_WAIT = 0,
     STAT_FUTEX_WAKE = 1,

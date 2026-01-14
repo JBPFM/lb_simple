@@ -22,11 +22,18 @@ use scx_utils::scx_ops_open;
 
 const SCHEDULER_NAME: &str = "lb_simple";
 
+fn tick_interval_ns_from_hz() -> u64 {
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if hz <= 0 {
+        return 1_000_000;
+    }
+    1_000_000_000u64 / (hz as u64)
+}
+
 // 全局状态，保持 eBPF 程序和 OpenObject 的生命周期
 static SCHEDULER_STATE: OnceLock<SchedulerState> = OnceLock::new();
 
-// 全局 held_locks map handle，供 mutex_hook 使用
-pub(crate) static HELD_LOCKS_MAP: OnceLock<MapHandle> = OnceLock::new();
+pub(crate) static THREAD_STATE_PTRS_MAP: OnceLock<MapHandle> = OnceLock::new();
 
 struct SchedulerState {
     _link: Link,
@@ -48,9 +55,26 @@ fn init_scheduler(debug: bool) -> Result<SchedulerState> {
     // Open the BPF skeleton
     let mut skel = scx_ops_open!(skel_builder, open_object, lb_simple_ops, None)?;
 
-    // 设置 pid_filter 为当前进程的 PID
+    // 设置 BPF 参数
     if let Some(rodata) = &mut skel.maps.rodata_data {
-        rodata.pid_filter = std::process::id() as i32;
+        let tick_interval_ns = tick_interval_ns_from_hz();
+        let tick_guard_ns = std::env::var("LB_SIMPLE_TICK_GUARD_NS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(200_000);
+        let tick_extra_ns = std::env::var("LB_SIMPLE_TICK_EXTRA_NS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        let max_boost_hold_ns = std::env::var("LB_SIMPLE_MAX_BOOST_HOLD_NS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(5_000_000);
+
+        rodata.tick_interval_ns = tick_interval_ns;
+        rodata.tick_guard_ns = tick_guard_ns;
+        rodata.tick_extra_ns = tick_extra_ns;
+        rodata.max_boost_hold_ns = max_boost_hold_ns;
     }
 
     // Load the BPF program
@@ -59,9 +83,11 @@ fn init_scheduler(debug: bool) -> Result<SchedulerState> {
     // Attach the scheduler
     let _link = scx_ops_attach!(skel, lb_simple_ops)?;
 
-    let held_locks_map_id = skel.maps.held_locks.info()?.info.id;
-    let held_locks_handle = MapHandle::from_map_id(held_locks_map_id)?;
-    let _ = HELD_LOCKS_MAP.set(held_locks_handle);
+    let thread_state_ptrs_map_id = skel.maps.thread_state_ptrs.info()?.info.id;
+    let thread_state_ptrs_handle = MapHandle::from_map_id(thread_state_ptrs_map_id)?;
+    let _ = THREAD_STATE_PTRS_MAP.set(thread_state_ptrs_handle);
+
+    mutex_hook::register_current_thread();
 
     info!("{SCHEDULER_NAME} scheduler started via LD_PRELOAD");
     Ok(SchedulerState { _link })
