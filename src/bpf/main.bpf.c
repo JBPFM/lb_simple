@@ -12,7 +12,6 @@
  * 4. 若线程在临界区内且时间片即将耗尽，则续期时间片
  */
 #include <scx/common.bpf.h>
-#include "intf.h"
 
 char _license[] SEC("license") = "GPL";
 
@@ -25,10 +24,10 @@ UEI_DEFINE(uei);
 
 /* Map 容量常量 */
 #define THREAD_STATE_MAP_MAX_ENTRIES 100000
-#define CS_START_MAP_MAX_ENTRIES     100000
+#define CS_START_MAP_MAX_ENTRIES 100000
 
 /* 默认 tick 间隔 (1ms = 1000000ns) */
-#define DEFAULT_TICK_INTERVAL_NS     1000000ULL
+#define DEFAULT_TICK_INTERVAL_NS 1000000ULL
 
 /* thread_state_ptrs: tid -> 用户态 TLS 指针，用于读取锁深度 */
 struct {
@@ -37,14 +36,6 @@ struct {
   __type(value, unsigned long long);
   __uint(max_entries, THREAD_STATE_MAP_MAX_ENTRIES);
 } thread_state_ptrs SEC(".maps");
-
-/* cs_start_ns: tid -> 临界区开始时间 (ns)，用于限制最大续期时间 */
-struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
-  __type(key, u32);
-  __type(value, unsigned long long);
-  __uint(max_entries, CS_START_MAP_MAX_ENTRIES);
-} cs_start_ns SEC(".maps");
 
 s32 BPF_STRUCT_OPS(lb_simple_select_cpu, struct task_struct *p, s32 prev_cpu,
                    u64 wake_flags) {
@@ -56,8 +47,8 @@ s32 BPF_STRUCT_OPS(lb_simple_select_cpu, struct task_struct *p, s32 prev_cpu,
   return cpu;
 }
 
-static __always_inline bool read_user_lock_depth(u32 tid, unsigned int *out_depth)
-{
+static __always_inline bool read_user_lock_depth(u32 tid,
+                                                 unsigned int *out_depth) {
   unsigned long long *uptr;
 
   uptr = bpf_map_lookup_elem(&thread_state_ptrs, &tid);
@@ -71,38 +62,12 @@ static __always_inline bool read_user_lock_depth(u32 tid, unsigned int *out_dept
 }
 
 /*
- * track_cs_duration - 追踪临界区持续时间
- * @tid: 线程 ID
- * @now: 当前时间戳 (ns)
- *
- * 返回值:
- *   true  - 临界区有效，可以续期
- *   false - 超过最大续期时间，不再续期
- */
-static __always_inline bool track_cs_duration(u32 tid, unsigned long long now)
-{
-  unsigned long long *startp;
-
-  startp = bpf_map_lookup_elem(&cs_start_ns, &tid);
-  if (!startp) {
-    bpf_map_update_elem(&cs_start_ns, &tid, &now, BPF_ANY);
-    return true;
-  }
-
-  if (max_boost_hold_ns && now - *startp > max_boost_hold_ns)
-    return false;
-
-  return true;
-}
-
-/*
  * try_extend_slice - 尝试续期时间片
  * @p: 任务结构体
  *
  * 仅当时间片即将耗尽时才续期，避免过度续期导致其他任务饥饿
  */
-static __always_inline void try_extend_slice(struct task_struct *p)
-{
+static __always_inline void try_extend_slice(struct task_struct *p) {
   unsigned long long interval, threshold, target;
 
   interval = tick_interval_ns ? tick_interval_ns : DEFAULT_TICK_INTERVAL_NS;
@@ -116,40 +81,27 @@ static __always_inline void try_extend_slice(struct task_struct *p)
     p->scx.slice = target;
 }
 
-void BPF_STRUCT_OPS(lb_simple_tick, struct task_struct *p)
-{
+void BPF_STRUCT_OPS(lb_simple_tick, struct task_struct *p) {
   unsigned int depth;
-  unsigned long long now;
   u32 tid;
 
   tid = p->pid;
   if (!read_user_lock_depth(tid, &depth))
     return;
 
-  now = bpf_ktime_get_ns();
-
   if (!depth) {
-    bpf_map_delete_elem(&cs_start_ns, &tid);
     return;
   }
-
-  if (!track_cs_duration(tid, now))
-    return;
 
   try_extend_slice(p);
 }
 
-s32 BPF_STRUCT_OPS_SLEEPABLE(lb_simple_init) {
-  return 0;
-}
+s32 BPF_STRUCT_OPS_SLEEPABLE(lb_simple_init) { return 0; }
 
 void BPF_STRUCT_OPS(lb_simple_exit, struct scx_exit_info *ei) {
   UEI_RECORD(uei, ei);
 }
 
-SCX_OPS_DEFINE(lb_simple_ops,
-               .select_cpu = (void *)lb_simple_select_cpu,
-               .tick = (void *)lb_simple_tick,
-               .init = (void *)lb_simple_init,
-               .exit = (void *)lb_simple_exit,
-               .name = "lb_simple");
+SCX_OPS_DEFINE(lb_simple_ops, .select_cpu = (void *)lb_simple_select_cpu,
+               .tick = (void *)lb_simple_tick, .init = (void *)lb_simple_init,
+               .exit = (void *)lb_simple_exit, .name = "lb_simple");
