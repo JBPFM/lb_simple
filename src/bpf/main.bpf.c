@@ -19,8 +19,14 @@ const volatile unsigned long long tick_interval_ns;
 const volatile unsigned long long tick_guard_ns;
 const volatile unsigned long long tick_extra_ns;
 const volatile unsigned long long max_boost_hold_ns;
+const volatile u32 nr_cores = 0;
 
 UEI_DEFINE(uei);
+
+/* 自定义 DSQ ID 定义 */
+#define CUSTOM_DSQ_GLOBAL 0
+/* Per-CPU DSQ 从 1 开始编号: DSQ ID = 1 + cpu_id */
+#define CUSTOM_DSQ_PERCPU_BASE 1
 
 /* Map 容量常量 */
 #define THREAD_STATE_MAP_MAX_ENTRIES 100000
@@ -40,11 +46,49 @@ struct {
 s32 BPF_STRUCT_OPS(lb_simple_select_cpu, struct task_struct *p, s32 prev_cpu,
                    u64 wake_flags) {
   bool is_idle = false;
-  s32 cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
+  s32 cpu;
+  u64 dsq_id;
+
+  cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
   if (is_idle) {
-    scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+    /* 使用自定义的 per-cpu 优先级队列 */
+    dsq_id = CUSTOM_DSQ_PERCPU_BASE + cpu;
+    scx_bpf_dsq_insert(p, dsq_id, SCX_SLICE_DFL, 0);
   }
   return cpu;
+}
+
+void BPF_STRUCT_OPS(lb_simple_enqueue, struct task_struct *p, u64 enq_flags) {
+  s32 cpu;
+  u64 dsq_id;
+
+  /*
+   * 优先入队到任务的目标 CPU 的 per-cpu 队列
+   * 如果无法确定 CPU，则入队到 global 队列
+   *
+   * 注：当 select_cpu 中调用 scx_bpf_dsq_insert 后，
+   * enqueue 回调不会被调用，无需额外检查
+   */
+  cpu = scx_bpf_task_cpu(p);
+  if (cpu >= 0 && (u32)cpu < nr_cores) {
+    dsq_id = CUSTOM_DSQ_PERCPU_BASE + cpu;
+  } else {
+    dsq_id = CUSTOM_DSQ_GLOBAL;
+  }
+
+  scx_bpf_dsq_insert(p, dsq_id, SCX_SLICE_DFL, enq_flags);
+}
+
+void BPF_STRUCT_OPS(lb_simple_dispatch, s32 cpu, struct task_struct *prev) {
+  u64 dsq_id;
+
+  /* 首先从本 CPU 的 per-cpu 队列消费 */
+  dsq_id = CUSTOM_DSQ_PERCPU_BASE + cpu;
+  if (scx_bpf_dsq_move_to_local(dsq_id))
+    return;
+
+  /* 然后从 global 队列消费 */
+  scx_bpf_dsq_move_to_local(CUSTOM_DSQ_GLOBAL);
 }
 
 static __always_inline bool read_user_lock_depth(u32 tid,
@@ -96,12 +140,42 @@ void BPF_STRUCT_OPS(lb_simple_tick, struct task_struct *p) {
   try_extend_slice(p);
 }
 
-s32 BPF_STRUCT_OPS_SLEEPABLE(lb_simple_init) { return 0; }
+s32 BPF_STRUCT_OPS_SLEEPABLE(lb_simple_init) {
+  u32 i;
+  s32 ret;
+
+  /* 创建自定义 global 队列 */
+  ret = scx_bpf_create_dsq(CUSTOM_DSQ_GLOBAL, -1);
+  if (ret) {
+    scx_bpf_error("创建 global DSQ 失败: %d", ret);
+    return ret;
+  }
+
+  /*
+   * 创建 nr_cores 个 per-cpu 优先级队列
+   * 使用 -1 作为 NUMA node 参数，让内核自动选择最优节点
+   * 避免跨 NUMA 节点访问延迟
+   */
+  for (i = 0; i < nr_cores; i++) {
+    ret = scx_bpf_create_dsq(CUSTOM_DSQ_PERCPU_BASE + i, -1);
+    if (ret) {
+      scx_bpf_error("创建 per-cpu DSQ[%u] 失败: %d", i, ret);
+      return ret;
+    }
+  }
+
+  return 0;
+}
 
 void BPF_STRUCT_OPS(lb_simple_exit, struct scx_exit_info *ei) {
   UEI_RECORD(uei, ei);
 }
 
-SCX_OPS_DEFINE(lb_simple_ops, .select_cpu = (void *)lb_simple_select_cpu,
-               .tick = (void *)lb_simple_tick, .init = (void *)lb_simple_init,
-               .exit = (void *)lb_simple_exit, .name = "lb_simple");
+SCX_OPS_DEFINE(lb_simple_ops,
+               .select_cpu = (void *)lb_simple_select_cpu,
+               .enqueue = (void *)lb_simple_enqueue,
+               .dispatch = (void *)lb_simple_dispatch,
+               .tick = (void *)lb_simple_tick,
+               .init = (void *)lb_simple_init,
+               .exit = (void *)lb_simple_exit,
+               .name = "lb_simple");

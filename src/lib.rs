@@ -71,10 +71,16 @@ fn init_scheduler(debug: bool) -> Result<SchedulerState> {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(5_000_000);
 
+        // 获取 CPU 核心数用于创建 per-cpu 队列
+        let nr_cores = libbpf_rs::num_possible_cpus().unwrap_or(1) as u32;
+
         rodata.tick_interval_ns = tick_interval_ns;
         rodata.tick_guard_ns = tick_guard_ns;
         rodata.tick_extra_ns = tick_extra_ns;
         rodata.max_boost_hold_ns = max_boost_hold_ns;
+        rodata.nr_cores = nr_cores;
+
+        info!("Initializing with {} CPU cores", nr_cores);
     }
 
     // Load the BPF program
