@@ -142,7 +142,7 @@ run_single_test() {
     local db_bench_cmd="$DB_BENCH --benchmarks=$BENCHMARK --threads=$threads --num=$OPS"
 
     if [ "$MODE" = "baseline" ]; then
-        sudo bpftrace "$FUTEX_BT" -c "$db_bench_cmd" 2>&1
+        sudo taskset -c 0 bpftrace "$FUTEX_BT" -c "$db_bench_cmd" 2>&1
     elif [ "$MODE" = "lb_simple" ]; then
         if [ "${LB_SIMPLE_METHOD:-}" = "bin" ]; then
             sudo bpftrace "$FUTEX_BT" -c "$LB_SIMPLE_BIN_PATH -- $db_bench_cmd" 2>&1
