@@ -43,6 +43,20 @@ struct {
   __uint(max_entries, THREAD_STATE_MAP_MAX_ENTRIES);
 } thread_state_ptrs SEC(".maps");
 
+static __always_inline bool read_user_lock_depth(u32 tid,
+                                                 unsigned int *out_depth) {
+  unsigned long long *uptr;
+
+  uptr = bpf_map_lookup_elem(&thread_state_ptrs, &tid);
+  if (!uptr)
+    return false;
+
+  if (bpf_probe_read_user(out_depth, sizeof(*out_depth), (void *)*uptr))
+    return false;
+
+  return true;
+}
+
 s32 BPF_STRUCT_OPS(lb_simple_select_cpu, struct task_struct *p, s32 prev_cpu,
                    u64 wake_flags) {
   bool is_idle = false;
@@ -59,19 +73,32 @@ s32 BPF_STRUCT_OPS(lb_simple_select_cpu, struct task_struct *p, s32 prev_cpu,
 }
 
 void BPF_STRUCT_OPS(lb_simple_enqueue, struct task_struct *p, u64 enq_flags) {
-  s32 cpu;
+  s32 task_cpu;
   u64 dsq_id;
+  u32 tid;
+  unsigned int depth;
 
   /*
-   * 优先入队到任务的目标 CPU 的 per-cpu 队列
+   * 优先调度策略：持有锁的线程直接入队到 local 队列
+   * 这样可以最快得到调度，减少临界区持有时间，降低锁竞争
+   */
+  tid = p->pid;
+  if (read_user_lock_depth(tid, &depth) && depth > 0) {
+    /* 持锁线程直接插入 local 队列，获得最高优先级 */
+    scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
+    return;
+  }
+
+  /*
+   * 未持锁线程：优先入队到任务的目标 CPU 的 per-cpu 队列
    * 如果无法确定 CPU，则入队到 global 队列
    *
    * 注：当 select_cpu 中调用 scx_bpf_dsq_insert 后，
    * enqueue 回调不会被调用，无需额外检查
    */
-  cpu = scx_bpf_task_cpu(p);
-  if (cpu >= 0 && (u32)cpu < nr_cores) {
-    dsq_id = CUSTOM_DSQ_PERCPU_BASE + cpu;
+  task_cpu = scx_bpf_task_cpu(p);
+  if (task_cpu >= 0 && (u32)task_cpu < nr_cores) {
+    dsq_id = CUSTOM_DSQ_PERCPU_BASE + task_cpu;
   } else {
     dsq_id = CUSTOM_DSQ_GLOBAL;
   }
@@ -89,20 +116,6 @@ void BPF_STRUCT_OPS(lb_simple_dispatch, s32 cpu, struct task_struct *prev) {
 
   /* 然后从 global 队列消费 */
   scx_bpf_dsq_move_to_local(CUSTOM_DSQ_GLOBAL);
-}
-
-static __always_inline bool read_user_lock_depth(u32 tid,
-                                                 unsigned int *out_depth) {
-  unsigned long long *uptr;
-
-  uptr = bpf_map_lookup_elem(&thread_state_ptrs, &tid);
-  if (!uptr)
-    return false;
-
-  if (bpf_probe_read_user(out_depth, sizeof(*out_depth), (void *)*uptr))
-    return false;
-
-  return true;
 }
 
 /*
