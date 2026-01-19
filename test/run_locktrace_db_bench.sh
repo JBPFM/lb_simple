@@ -95,15 +95,27 @@ if [ ! -f "$FUTEX_BT" ]; then
 fi
 
 if [ "$MODE" = "lb_simple" ]; then
-    if [ ! -f "$PROJECT_ROOT/$LB_SIMPLE_LIB" ] && [ ! -f "$LB_SIMPLE_LIB" ]; then
-        log_error "liblb_simple.so not found. Please build first: cargo build --release"
+    # Prefer the new usage: `sudo lb_simple -- <cmd>`
+    if [ -x "$PROJECT_ROOT/$LB_SIMPLE_BIN" ]; then
+        LB_SIMPLE_BIN_PATH="$PROJECT_ROOT/$LB_SIMPLE_BIN"
+        LB_SIMPLE_METHOD="bin"
+    elif [ -x "$LB_SIMPLE_BIN" ]; then
+        LB_SIMPLE_BIN_PATH="$LB_SIMPLE_BIN"
+        LB_SIMPLE_METHOD="bin"
+    elif [ -f "$PROJECT_ROOT/$LB_SIMPLE_LIB" ]; then
+        LB_SIMPLE_LIB_PATH="$PROJECT_ROOT/$LB_SIMPLE_LIB"
+        LB_SIMPLE_METHOD="preload"
+    elif [ -f "$LB_SIMPLE_LIB" ]; then
+        LB_SIMPLE_LIB_PATH="$LB_SIMPLE_LIB"
+        LB_SIMPLE_METHOD="preload"
+    else
+        log_error "lb_simple not found."
+        log_error "Tried executable: $LB_SIMPLE_BIN and library: $LB_SIMPLE_LIB"
+        log_error "Please build first: cargo build --release"
         exit 1
     fi
-    if [ -f "$PROJECT_ROOT/$LB_SIMPLE_LIB" ]; then
-        LB_SIMPLE_LIB_PATH="$PROJECT_ROOT/$LB_SIMPLE_LIB"
-    else
-        LB_SIMPLE_LIB_PATH="$LB_SIMPLE_LIB"
-    fi
+
+    log_info "lb_simple method: $LB_SIMPLE_METHOD"
 fi
 
 FULL_OUTPUT_DIR="$SCRIPT_DIR/$OUTPUT_DIR"
@@ -128,11 +140,15 @@ run_single_test() {
     local output_file="$3"
     
     local db_bench_cmd="$DB_BENCH --benchmarks=$BENCHMARK --threads=$threads --num=$OPS"
-    
+
     if [ "$MODE" = "baseline" ]; then
-        sudo bpftrace "$FUTEX_BT" -c "env $db_bench_cmd" 2>&1
+        sudo bpftrace "$FUTEX_BT" -c "$db_bench_cmd" 2>&1
     elif [ "$MODE" = "lb_simple" ]; then
-        sudo bpftrace "$FUTEX_BT" -c "env LD_PRELOAD=$LB_SIMPLE_LIB_PATH $db_bench_cmd" 2>&1
+        if [ "${LB_SIMPLE_METHOD:-}" = "bin" ]; then
+            sudo bpftrace "$FUTEX_BT" -c "$LB_SIMPLE_BIN_PATH -- $db_bench_cmd" 2>&1
+        else
+            sudo taskset -c 0 bpftrace "$FUTEX_BT" -c "env LD_PRELOAD=$LB_SIMPLE_LIB_PATH $db_bench_cmd" 2>&1
+        fi
     else
         log_error "Unknown mode: $MODE"
         return 1

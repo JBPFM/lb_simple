@@ -8,6 +8,9 @@ DB_BENCH="${DB_BENCH:-/home/jz/test/test/leveldb/build/db_bench}"
 # lb_simple 库路径 (用于 LD_PRELOAD)
 LB_SIMPLE_LIB="${LB_SIMPLE_LIB:-./target/release/liblb_simple.so}"
 
+# lb_simple 可执行文件路径（用于：sudo lb_simple -- <cmd>）
+LB_SIMPLE_BIN="${LB_SIMPLE_BIN:-./target/release/lb_simple}"
+
 # 线程数列表
 THREAD_COUNTS="${THREAD_COUNTS:-16 32 48 64 80 96 112 128 160 192 256}"
 
