@@ -13,6 +13,9 @@
  */
 #include <scx/common.bpf.h>
 
+// #define TICK_EXTEND
+#define EAGER_ENQUEUE
+
 char _license[] SEC("license") = "GPL";
 
 const volatile unsigned long long tick_interval_ns;
@@ -78,6 +81,7 @@ void BPF_STRUCT_OPS(lb_simple_enqueue, struct task_struct *p, u64 enq_flags) {
   u32 tid;
   unsigned int depth;
 
+  #ifdef EAGER_ENQUEUE
   /*
    * 优先调度策略：持有锁的线程直接入队到 local 队列
    * 这样可以最快得到调度，减少临界区持有时间，降低锁竞争
@@ -85,9 +89,10 @@ void BPF_STRUCT_OPS(lb_simple_enqueue, struct task_struct *p, u64 enq_flags) {
   tid = p->pid;
   if (read_user_lock_depth(tid, &depth) && depth > 0) {
     /* 持锁线程直接插入 local 队列，获得最高优先级 */
-    scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
+    scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags | SCX_ENQ_HEAD | SCX_ENQ_PREEMPT);
     return;
   }
+#endif
 
   /*
    * 未持锁线程：优先入队到任务的目标 CPU 的 per-cpu 队列
@@ -138,6 +143,7 @@ static __always_inline void try_extend_slice(struct task_struct *p) {
     p->scx.slice = target;
 }
 
+#ifdef TICK_EXTEND
 void BPF_STRUCT_OPS(lb_simple_tick, struct task_struct *p) {
   unsigned int depth;
   u32 tid;
@@ -152,6 +158,7 @@ void BPF_STRUCT_OPS(lb_simple_tick, struct task_struct *p) {
 
   try_extend_slice(p);
 }
+#endif
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(lb_simple_init) {
   u32 i;
@@ -188,7 +195,9 @@ SCX_OPS_DEFINE(lb_simple_ops,
                .select_cpu = (void *)lb_simple_select_cpu,
                .enqueue = (void *)lb_simple_enqueue,
                .dispatch = (void *)lb_simple_dispatch,
+               #ifdef TICK_EXTEND
                .tick = (void *)lb_simple_tick,
+               #endif
                .init = (void *)lb_simple_init,
                .exit = (void *)lb_simple_exit,
                .name = "lb_simple");

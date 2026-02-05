@@ -94,6 +94,36 @@ sudo ./target/release/lb_simple -d -i 5 -- /bin/bash -c "echo Hello World"
 sudo ./target/release/lb_simple -- /usr/bin/python3 script.py
 ```
 
+## 基准测试与数据分析
+
+本仓库在 `test/` 下提供了基于 `db_bench + bpftrace` 的 futex 跟踪实验脚本与数据分析脚本。
+
+### 1) 运行实验（生成原始数据）
+
+- baseline：
+```bash
+./test/run_locktrace_db_bench.sh -m baseline
+```
+
+- lb_simple：
+```bash
+./test/run_locktrace_db_bench.sh -m lb_simple
+```
+
+原始输出默认写入 `test/results/`（可通过 `test/config.sh` 或命令行参数覆盖）。
+
+### 2) 分析数据（生成汇总 CSV/Markdown）
+
+```bash
+python3 test/analyze_locktrace_db_bench.py -i test/results -o test/results/locktrace_db_bench
+```
+
+输出文件：
+- `test/results/locktrace_db_bench.runs.csv`：逐次运行解析结果（每个 `.txt` 一行）
+- `test/results/locktrace_db_bench.aggregate.csv`：按 `(mode, threads)` 聚合的均值/标准差
+- `test/results/locktrace_db_bench.compare.csv`：`lb_simple` 相对 `baseline` 的 ratio / pct change
+- `test/results/locktrace_db_bench.report.md`：可直接阅读的汇总报告
+
 
 ## 工作原理
 
