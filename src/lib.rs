@@ -20,14 +20,6 @@ use scx_utils::scx_ops_open;
 
 const SCHEDULER_NAME: &str = "lb_simple";
 
-fn tick_interval_ns_from_hz() -> u64 {
-    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    if hz <= 0 {
-        return 1_000_000;
-    }
-    1_000_000_000u64 / (hz as u64)
-}
-
 // 全局状态，保持 eBPF 程序和 OpenObject 的生命周期
 static SCHEDULER_STATE: OnceLock<SchedulerState> = OnceLock::new();
 
@@ -50,23 +42,6 @@ fn init_scheduler(debug: bool) -> Result<SchedulerState> {
 
     // Open the BPF skeleton
     let mut skel = scx_ops_open!(skel_builder, open_object, lb_simple_ops, None)?;
-
-    // 设置 BPF 参数
-    if let Some(rodata) = &mut skel.maps.rodata_data {
-        let tick_interval_ns = tick_interval_ns_from_hz();
-        let tick_guard_ns = std::env::var("LB_SIMPLE_TICK_GUARD_NS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(200_000);
-        let tick_extra_ns = std::env::var("LB_SIMPLE_TICK_EXTRA_NS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0);
-
-        rodata.tick_interval_ns = tick_interval_ns;
-        rodata.tick_guard_ns = tick_guard_ns;
-        rodata.tick_extra_ns = tick_extra_ns;
-    }
 
     // Load the BPF program
     let mut skel = scx_ops_load!(skel, lb_simple_ops, uei)?;

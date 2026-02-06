@@ -13,14 +13,7 @@
 
 char _license[] SEC("license") = "GPL";
 
-const volatile unsigned long long tick_interval_ns;
-const volatile unsigned long long tick_guard_ns;
-const volatile unsigned long long tick_extra_ns;
-
 UEI_DEFINE(uei);
-
-/* 默认 tick 间隔 (1ms = 1000000ns) */
-#define DEFAULT_TICK_INTERVAL_NS 1000000ULL
 
 s32 BPF_STRUCT_OPS(lb_simple_select_cpu, struct task_struct *p, s32 prev_cpu,
                    u64 wake_flags) {
@@ -32,30 +25,6 @@ s32 BPF_STRUCT_OPS(lb_simple_select_cpu, struct task_struct *p, s32 prev_cpu,
   return cpu;
 }
 
-/*
- * try_extend_slice - 尝试续期时间片
- * @p: 任务结构体
- *
- * 仅当时间片即将耗尽时才续期，避免过度续期导致其他任务饥饿
- */
-static __always_inline void try_extend_slice(struct task_struct *p) {
-  unsigned long long interval, threshold, target;
-
-  interval = tick_interval_ns ? tick_interval_ns : DEFAULT_TICK_INTERVAL_NS;
-  threshold = interval + tick_guard_ns;
-
-  if (p->scx.slice > threshold)
-    return;
-
-  target = interval + tick_extra_ns;
-  if (p->scx.slice < target)
-    p->scx.slice = target;
-}
-
-void BPF_STRUCT_OPS(lb_simple_tick, struct task_struct *p) {
-  try_extend_slice(p);
-}
-
 s32 BPF_STRUCT_OPS_SLEEPABLE(lb_simple_init) { return 0; }
 
 void BPF_STRUCT_OPS(lb_simple_exit, struct scx_exit_info *ei) {
@@ -63,5 +32,5 @@ void BPF_STRUCT_OPS(lb_simple_exit, struct scx_exit_info *ei) {
 }
 
 SCX_OPS_DEFINE(lb_simple_ops, .select_cpu = (void *)lb_simple_select_cpu,
-               .tick = (void *)lb_simple_tick, .init = (void *)lb_simple_init,
-               .exit = (void *)lb_simple_exit, .name = "lb_simple");
+               .init = (void *)lb_simple_init, .exit = (void *)lb_simple_exit,
+               .name = "lb_simple");

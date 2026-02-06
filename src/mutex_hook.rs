@@ -12,7 +12,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::thread::yield_now;
 
-const SPINPARK_SPIN_TIME: u32 = 2700;
+const SPINPARK_SPIN_TIME: u32 = 128;
 
 const OBJ_UNINIT: u32 = 0;
 const OBJ_INITING: u32 = 1;
@@ -266,13 +266,7 @@ fn spinpark_lock(lock: *mut SpinparkLock) {
 #[inline]
 fn spinpark_unlock(lock: *mut SpinparkLock) -> c_int {
     let lock_ref = unsafe { &*lock };
-    if lock_ref
-        .data
-        .compare_exchange(1, 0, Ordering::Release, Ordering::Relaxed)
-        .is_err()
-    {
-        return libc::EPERM;
-    }
+    lock_ref.data.store(0, Ordering::Release);
     0
 }
 
