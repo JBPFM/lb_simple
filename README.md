@@ -1,12 +1,13 @@
 # lb_simple
 
-一个简单的全局加权虚拟时间调度器，基于 eBPF 和 sched_ext 框架实现。
+一个简单的调度器模板，基于 eBPF 和 sched_ext 框架实现, 还需进一步的实现。
 
 ## 功能特性
 
 - 基于 eBPF 的进程调度器
 - 支持为特定进程启用调度策略
 - 使用虚拟时间（vtime）进行公平调度
+- `LD_PRELOAD` hook `pthread_mutex_lock/trylock/unlock`，以简单 spinlock 方式实现
 - 支持详细的调试和统计信息输出
 
 ## 系统要求
@@ -104,45 +105,3 @@ sudo ./target/release/lb_simple -- /usr/bin/python3 script.py
 5. 等待子进程完成后退出
 
 调度器使用 PID 过滤器只对指定的子进程及其派生进程应用调度策略。
-
-## 锁临界区检测与 Tick 续期
-
-为避免线程在用户态锁临界区内被时间片打断，本项目实现了一个“仅在本次 tick 周期内会耗尽 slice 时才续期”的策略，并带有最长续期上限以避免饥饿。
-
-### 核心思路
-
-- Userspace（`LD_PRELOAD`）在每个线程维护 TLS 状态（仅 `depth`），`pthread_mutex_lock/trylock/unlock` 热路径只更新 TLS，不进行 map 更新。
-- 线程创建/退出时，将 TLS 地址注册/注销到 eBPF map：`thread_state_ptrs: tid -> user_ptr`。
-- eBPF `ops.tick()` 通过 `bpf_probe_read_user()` 读取 TLS：
-  - 若 `depth > 0`，认为处于临界区；临界区开始时间在内核侧通过 `cs_start_ns` map（`tid -> start_ns`）记录，并用 `max_boost_hold_ns` 做最长续期上限。
-  - 若 `p->scx.slice <= tick_interval_ns + tick_guard_ns`（即本 tick 周期内会耗尽 slice），将 `p->scx.slice` 补到 `tick_interval_ns + tick_extra_ns`（方案 A：只保证撑过 1 个 tick）。
-
-### 参数与环境变量
-
-- `tick_interval_ns`：启动时通过 `sysconf(_SC_CLK_TCK)` 自动计算（无需手工配置）。
-- `LB_SIMPLE_MAX_BOOST_HOLD_NS`：单次临界区允许续期的最长时间，默认 `5_000_000`（5ms）。
-- `LB_SIMPLE_TICK_GUARD_NS`：tick 抖动裕量，默认 `200_000`（200us）。
-- `LB_SIMPLE_TICK_EXTRA_NS`：续期额外补偿，默认 `0`。
-
-## 许可证
-
-GPL-2.0-only
-
-## 作者
-
-Copyright (c) 2024 Zhang Jiang
-
-## 故障排除
-
-### 权限错误
-确保使用 `sudo` 运行程序，eBPF 程序需要 root 权限。
-
-### 内核不支持 sched_ext
-检查内核版本和配置：
-```bash
-uname -r
-zgrep SCHED_CLASS_EXT /proc/config.gz
-```
-
-### 缺少参数错误
-如果看到"错误：必须指定要运行的二进制文件和参数"，请确保使用 `--` 分隔符并提供要运行的命令。

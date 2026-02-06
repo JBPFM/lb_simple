@@ -12,8 +12,6 @@ use std::sync::OnceLock;
 
 use anyhow::Result;
 use libbpf_rs::Link;
-use libbpf_rs::MapCore;
-use libbpf_rs::MapHandle;
 use libbpf_rs::OpenObject;
 use log::info;
 use scx_utils::scx_ops_attach;
@@ -32,8 +30,6 @@ fn tick_interval_ns_from_hz() -> u64 {
 
 // 全局状态，保持 eBPF 程序和 OpenObject 的生命周期
 static SCHEDULER_STATE: OnceLock<SchedulerState> = OnceLock::new();
-
-pub(crate) static THREAD_STATE_PTRS_MAP: OnceLock<MapHandle> = OnceLock::new();
 
 struct SchedulerState {
     _link: Link,
@@ -66,15 +62,10 @@ fn init_scheduler(debug: bool) -> Result<SchedulerState> {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
-        let max_boost_hold_ns = std::env::var("LB_SIMPLE_MAX_BOOST_HOLD_NS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(5_000_000);
 
         rodata.tick_interval_ns = tick_interval_ns;
         rodata.tick_guard_ns = tick_guard_ns;
         rodata.tick_extra_ns = tick_extra_ns;
-        rodata.max_boost_hold_ns = max_boost_hold_ns;
     }
 
     // Load the BPF program
@@ -82,12 +73,6 @@ fn init_scheduler(debug: bool) -> Result<SchedulerState> {
 
     // Attach the scheduler
     let _link = scx_ops_attach!(skel, lb_simple_ops)?;
-
-    let thread_state_ptrs_map_id = skel.maps.thread_state_ptrs.info()?.info.id;
-    let thread_state_ptrs_handle = MapHandle::from_map_id(thread_state_ptrs_map_id)?;
-    let _ = THREAD_STATE_PTRS_MAP.set(thread_state_ptrs_handle);
-
-    mutex_hook::register_current_thread();
 
     info!("{SCHEDULER_NAME} scheduler started via LD_PRELOAD");
     Ok(SchedulerState { _link })

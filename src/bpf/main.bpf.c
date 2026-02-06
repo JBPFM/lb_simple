@@ -2,14 +2,12 @@
 /*
  * lb_simple - 基于 sched_ext 的锁感知调度器
  *
- * 核心功能：检测线程是否持有用户态锁，若持有则在时间片即将耗尽时自动续期，
- * 防止持有锁的线程被切出导致优先级反转或锁竞争加剧。
+ * 核心功能：在 tick 周期内按阈值检查 slice，必要时进行小幅续期，
+ * 减少频繁切出带来的调度抖动。
  *
  * 工作原理：
- * 1. 用户态通过 LD_PRELOAD 钩住 pthread_mutex_* 函数，维护 TLS 中的锁深度
- * 2. 线程创建时将 TLS 地址注册到 thread_state_ptrs map
- * 3. BPF tick 回调通过 bpf_probe_read_user 读取 TLS 状态
- * 4. 若线程在临界区内且时间片即将耗尽，则续期时间片
+ * 1. BPF tick 回调检查任务当前剩余 slice
+ * 2. 若本 tick 周期内可能耗尽，则把 slice 补到目标值
  */
 #include <scx/common.bpf.h>
 
@@ -18,24 +16,11 @@ char _license[] SEC("license") = "GPL";
 const volatile unsigned long long tick_interval_ns;
 const volatile unsigned long long tick_guard_ns;
 const volatile unsigned long long tick_extra_ns;
-const volatile unsigned long long max_boost_hold_ns;
 
 UEI_DEFINE(uei);
 
-/* Map 容量常量 */
-#define THREAD_STATE_MAP_MAX_ENTRIES 100000
-#define CS_START_MAP_MAX_ENTRIES 100000
-
 /* 默认 tick 间隔 (1ms = 1000000ns) */
 #define DEFAULT_TICK_INTERVAL_NS 1000000ULL
-
-/* thread_state_ptrs: tid -> 用户态 TLS 指针，用于读取锁深度 */
-struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
-  __type(key, u32);
-  __type(value, unsigned long long);
-  __uint(max_entries, THREAD_STATE_MAP_MAX_ENTRIES);
-} thread_state_ptrs SEC(".maps");
 
 s32 BPF_STRUCT_OPS(lb_simple_select_cpu, struct task_struct *p, s32 prev_cpu,
                    u64 wake_flags) {
@@ -45,20 +30,6 @@ s32 BPF_STRUCT_OPS(lb_simple_select_cpu, struct task_struct *p, s32 prev_cpu,
     scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
   }
   return cpu;
-}
-
-static __always_inline bool read_user_lock_depth(u32 tid,
-                                                 unsigned int *out_depth) {
-  unsigned long long *uptr;
-
-  uptr = bpf_map_lookup_elem(&thread_state_ptrs, &tid);
-  if (!uptr)
-    return false;
-
-  if (bpf_probe_read_user(out_depth, sizeof(*out_depth), (void *)*uptr))
-    return false;
-
-  return true;
 }
 
 /*
@@ -82,17 +53,6 @@ static __always_inline void try_extend_slice(struct task_struct *p) {
 }
 
 void BPF_STRUCT_OPS(lb_simple_tick, struct task_struct *p) {
-  unsigned int depth;
-  u32 tid;
-
-  tid = p->pid;
-  if (!read_user_lock_depth(tid, &depth))
-    return;
-
-  if (!depth) {
-    return;
-  }
-
   try_extend_slice(p);
 }
 
