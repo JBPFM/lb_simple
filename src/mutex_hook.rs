@@ -3,13 +3,16 @@
 // Interpose pthread mutex/cond and back them with a pure spin-yield lock.
 
 use libc::{
-    c_int, pthread_cond_t, pthread_condattr_t, pthread_mutex_t, pthread_mutexattr_t, timespec,
+    c_int, c_void, pthread_cond_t, pthread_condattr_t, pthread_key_t, pthread_mutex_t,
+    pthread_mutexattr_t, timespec,
 };
+use std::cell::{Cell, UnsafeCell};
 use std::cmp::Ordering as CmpOrdering;
 use std::hint::spin_loop;
 use std::mem::{align_of, size_of};
 use std::ptr;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
 use std::thread::yield_now;
 
 const SPINPARK_SPIN_TIME: u32 = 128;
@@ -17,6 +20,49 @@ const SPINPARK_SPIN_TIME: u32 = 128;
 const OBJ_UNINIT: u32 = 0;
 const OBJ_INITING: u32 = 1;
 const OBJ_READY: u32 = 2;
+
+const YIELD_NONE: u32 = 0;
+const YIELD_LOCK_CONTENTION: u32 = 1;
+const YIELD_LOCK_HANDOFF: u32 = 2;
+const VIP_DSQ_BASE: u64 = 1;
+const VIP_DSQ_SLOTS: u32 = 4096;
+const VIP_DSQ_LAST: u64 = VIP_DSQ_BASE + (VIP_DSQ_SLOTS as u64) - 1;
+
+const BPF_MAP_UPDATE_ELEM: libc::c_long = 2;
+const BPF_MAP_DELETE_ELEM: libc::c_long = 3;
+
+/// Exposed from lib.rs once the scheduler is initialized.
+pub(crate) static YIELD_ADDR_MAP_FD: AtomicI32 = AtomicI32::new(-1);
+
+static TLS_CLEANUP_KEY: OnceLock<pthread_key_t> = OnceLock::new();
+static NEXT_VIP_SLOT: AtomicU32 = AtomicU32::new(0);
+static LOCK_ACQUIRE_CNT: AtomicU64 = AtomicU64::new(0);
+static YIELD_CONTENTION_CNT: AtomicU64 = AtomicU64::new(0);
+static YIELD_HANDOFF_CNT: AtomicU64 = AtomicU64::new(0);
+static YIELD_FALLBACK_CNT: AtomicU64 = AtomicU64::new(0);
+static HANDOFF_TAKEN_CNT: AtomicU64 = AtomicU64::new(0);
+static HANDOFF_MISS_CNT: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct YieldStatsSnapshot {
+    pub lock_acquire: u64,
+    pub contention_yield: u64,
+    pub handoff_yield: u64,
+    pub fallback_yield: u64,
+    pub handoff_taken: u64,
+    pub handoff_miss: u64,
+}
+
+pub(crate) fn yield_stats_snapshot() -> YieldStatsSnapshot {
+    YieldStatsSnapshot {
+        lock_acquire: LOCK_ACQUIRE_CNT.load(Ordering::Relaxed),
+        contention_yield: YIELD_CONTENTION_CNT.load(Ordering::Relaxed),
+        handoff_yield: YIELD_HANDOFF_CNT.load(Ordering::Relaxed),
+        fallback_yield: YIELD_FALLBACK_CNT.load(Ordering::Relaxed),
+        handoff_taken: HANDOFF_TAKEN_CNT.load(Ordering::Relaxed),
+        handoff_miss: HANDOFF_MISS_CNT.load(Ordering::Relaxed),
+    }
+}
 
 #[repr(C)]
 struct LockAs {
@@ -34,12 +80,220 @@ struct CondAs {
 struct SpinparkLock {
     // 0: unlocked, 1: locked.
     data: AtomicU32,
+    // 0: no handoff in progress, 1: unlock yielded for a waiter handoff.
+    handoff: AtomicU32,
+    // Number of waiters currently parked for this lock.
+    waiters: AtomicU32,
+    // Lock-dedicated VIP DSQ used by BPF routing and handoff.
+    vip_dsq_id: u64,
 }
 
 #[repr(C)]
 struct SpinparkCond {
     seq: AtomicU32,
     target: AtomicU32,
+}
+
+#[repr(C)]
+struct TaskYieldInfo {
+    reason: u32,
+    // seqcount: odd while writing, even when committed.
+    r#gen: u32,
+    vip_dsq_id: u64,
+}
+
+#[repr(C)]
+struct YieldAddrEntry {
+    user_ptr: u64,
+    last_gen: u32,
+    bpf_reason: u8,
+    pad: [u8; 3],
+    vip_dsq_id: u64,
+}
+
+#[repr(C)]
+struct BpfMapElemAttr {
+    map_fd: u32,
+    _pad0: u32,
+    key: u64,
+    value: u64,
+    flags: u64,
+}
+
+thread_local! {
+    static YIELD_INFO: UnsafeCell<TaskYieldInfo> = const { UnsafeCell::new(
+        TaskYieldInfo { reason: YIELD_NONE, r#gen: 0, vip_dsq_id: 0 }
+    ) };
+    static REGISTERED: Cell<bool> = const { Cell::new(false) };
+    static REGISTERED_TID: Cell<u32> = const { Cell::new(0) };
+    static CLEANUP_ARMED: Cell<bool> = const { Cell::new(false) };
+}
+
+#[inline]
+fn current_tid() -> u32 {
+    unsafe { libc::syscall(libc::SYS_gettid) as u32 }
+}
+
+#[inline]
+fn bpf_map_update_elem(fd: i32, key: *const c_void, value: *const c_void) -> i32 {
+    let attr = BpfMapElemAttr {
+        map_fd: fd as u32,
+        _pad0: 0,
+        key: key as u64,
+        value: value as u64,
+        flags: 0,
+    };
+
+    unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_MAP_UPDATE_ELEM,
+            &attr as *const _ as *const c_void,
+            size_of::<BpfMapElemAttr>(),
+        ) as i32
+    }
+}
+
+#[inline]
+fn bpf_map_delete_elem(fd: i32, key: *const c_void) -> i32 {
+    let attr = BpfMapElemAttr {
+        map_fd: fd as u32,
+        _pad0: 0,
+        key: key as u64,
+        value: 0,
+        flags: 0,
+    };
+
+    unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_MAP_DELETE_ELEM,
+            &attr as *const _ as *const c_void,
+            size_of::<BpfMapElemAttr>(),
+        ) as i32
+    }
+}
+
+extern "C" fn cleanup_registered_yield_addr(_value: *mut c_void) {
+    let fd = YIELD_ADDR_MAP_FD.load(Ordering::Acquire);
+    if fd < 0 {
+        return;
+    }
+
+    let tid = current_tid();
+    let _ = bpf_map_delete_elem(fd, (&tid as *const u32).cast::<c_void>());
+}
+
+fn get_cleanup_key() -> Option<pthread_key_t> {
+    if let Some(key) = TLS_CLEANUP_KEY.get() {
+        return Some(*key);
+    }
+
+    let mut new_key: pthread_key_t = 0;
+    let rc = unsafe { libc::pthread_key_create(&mut new_key, Some(cleanup_registered_yield_addr)) };
+    if rc != 0 {
+        return None;
+    }
+
+    if TLS_CLEANUP_KEY.set(new_key).is_err() {
+        unsafe { libc::pthread_key_delete(new_key) };
+    }
+
+    TLS_CLEANUP_KEY.get().copied()
+}
+
+fn arm_thread_cleanup() {
+    CLEANUP_ARMED.with(|armed| {
+        if armed.get() {
+            return;
+        }
+
+        let Some(key) = get_cleanup_key() else {
+            return;
+        };
+
+        let marker = std::ptr::NonNull::<u8>::dangling()
+            .as_ptr()
+            .cast::<c_void>();
+        let rc = unsafe { libc::pthread_setspecific(key, marker) };
+        if rc == 0 {
+            armed.set(true);
+        }
+    });
+}
+
+fn ensure_registered() {
+    let fd = YIELD_ADDR_MAP_FD.load(Ordering::Acquire);
+    if fd < 0 {
+        return;
+    }
+
+    let tid = current_tid();
+    REGISTERED.with(|registered| {
+        REGISTERED_TID.with(|registered_tid| {
+            if registered.get() && registered_tid.get() == tid {
+                return;
+            }
+
+            YIELD_INFO.with(|info| {
+                let entry = YieldAddrEntry {
+                    user_ptr: info.get() as u64,
+                    last_gen: 0,
+                    bpf_reason: YIELD_NONE as u8,
+                    pad: [0; 3],
+                    vip_dsq_id: 0,
+                };
+
+                let rc = bpf_map_update_elem(
+                    fd,
+                    (&tid as *const u32).cast::<c_void>(),
+                    (&entry as *const YieldAddrEntry).cast::<c_void>(),
+                );
+                if rc == 0 {
+                    registered.set(true);
+                    registered_tid.set(tid);
+                    arm_thread_cleanup();
+                } else {
+                    registered.set(false);
+                }
+            });
+        });
+    });
+}
+
+#[inline]
+fn set_yield_info(reason: u32, vip_dsq_id: u64) {
+    YIELD_INFO.with(|info| {
+        let p = info.get();
+        unsafe {
+            // Begin seqcount write section (odd gen).
+            let write_gen = (*p).r#gen.wrapping_add(1) | 1;
+            (*p).r#gen = write_gen;
+            fence(Ordering::Release);
+
+            (*p).reason = reason;
+            (*p).vip_dsq_id = vip_dsq_id;
+
+            // Commit seqcount write section (even gen).
+            fence(Ordering::Release);
+            (*p).r#gen = write_gen.wrapping_add(1);
+        }
+    });
+}
+
+#[inline]
+fn alloc_vip_dsq_id() -> u64 {
+    let slot = NEXT_VIP_SLOT.fetch_add(1, Ordering::Relaxed);
+    if slot >= VIP_DSQ_SLOTS {
+        return 0;
+    }
+    VIP_DSQ_BASE + slot as u64
+}
+
+#[inline]
+fn strong_handoff_enabled(lock_ref: &SpinparkLock) -> bool {
+    let id = lock_ref.vip_dsq_id;
+    id >= VIP_DSQ_BASE && id <= VIP_DSQ_LAST
 }
 
 #[inline]
@@ -104,6 +358,9 @@ fn get_or_init_lock(mutex: *mut pthread_mutex_t, create: bool) -> Result<*mut Sp
                 if won.is_ok() {
                     let lock = Box::new(SpinparkLock {
                         data: AtomicU32::new(0),
+                        handoff: AtomicU32::new(0),
+                        waiters: AtomicU32::new(0),
+                        vip_dsq_id: alloc_vip_dsq_id(),
                     });
                     let lock_ptr = Box::into_raw(lock);
                     unsafe {
@@ -242,6 +499,7 @@ fn spinpark_trylock(lock: *mut SpinparkLock) -> c_int {
         .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
         .is_ok()
     {
+        LOCK_ACQUIRE_CNT.fetch_add(1, Ordering::Relaxed);
         return 0;
     }
     libc::EBUSY
@@ -250,22 +508,97 @@ fn spinpark_trylock(lock: *mut SpinparkLock) -> c_int {
 #[inline]
 fn spinpark_lock(lock: *mut SpinparkLock) {
     let lock_ref = unsafe { &*lock };
-    let mut backoff = 0;
+    let mut spin_count = 0u32;
+
     loop {
-        if lock_ref
-            .data
-            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
+        // TTAS: only attempt RMW when lock looks free.
+        if lock_ref.data.load(Ordering::Relaxed) == 0
+            && lock_ref
+                .data
+                .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
         {
+            LOCK_ACQUIRE_CNT.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        spin_yield_backoff(&mut backoff);
+
+        spin_count = spin_count.wrapping_add(1);
+        if spin_count < SPINPARK_SPIN_TIME {
+            spin_loop();
+            continue;
+        }
+
+        if !strong_handoff_enabled(lock_ref) {
+            // Fallback mode for locks without a dedicated VIP DSQ.
+            YIELD_FALLBACK_CNT.fetch_add(1, Ordering::Relaxed);
+            unsafe { libc::sched_yield() };
+            spin_count = 0;
+            continue;
+        }
+
+        // Declare waiter once per park and avoid losing handoff if unlock won the
+        // race before we reached sched_yield().
+        lock_ref.waiters.fetch_add(1, Ordering::AcqRel);
+        if lock_ref.data.load(Ordering::Acquire) == 0
+            && lock_ref
+                .data
+                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        {
+            lock_ref.waiters.fetch_sub(1, Ordering::Release);
+            LOCK_ACQUIRE_CNT.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        ensure_registered();
+        set_yield_info(YIELD_LOCK_CONTENTION, lock_ref.vip_dsq_id);
+        YIELD_CONTENTION_CNT.fetch_add(1, Ordering::Relaxed);
+        unsafe { libc::sched_yield() };
+
+        /*
+         * Correctness first: resumed task may come from generic yield paths.
+         * Treat handoff as acquired only when we consume handoff == 1.
+         */
+        if lock_ref
+            .handoff
+            .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            lock_ref.waiters.fetch_sub(1, Ordering::Release);
+            HANDOFF_TAKEN_CNT.fetch_add(1, Ordering::Relaxed);
+            LOCK_ACQUIRE_CNT.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        lock_ref.waiters.fetch_sub(1, Ordering::Release);
+        spin_count = 0;
     }
 }
 
 #[inline]
 fn spinpark_unlock(lock: *mut SpinparkLock) -> c_int {
     let lock_ref = unsafe { &*lock };
+
+    if strong_handoff_enabled(lock_ref) && lock_ref.waiters.load(Ordering::Acquire) != 0 {
+        ensure_registered();
+        lock_ref.handoff.store(1, Ordering::Release);
+        set_yield_info(YIELD_LOCK_HANDOFF, lock_ref.vip_dsq_id);
+        YIELD_HANDOFF_CNT.fetch_add(1, Ordering::Relaxed);
+        unsafe { libc::sched_yield() };
+
+        // If nobody consumed handoff, release lock normally.
+        if lock_ref
+            .handoff
+            .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            HANDOFF_MISS_CNT.fetch_add(1, Ordering::Relaxed);
+            lock_ref.data.store(0, Ordering::Release);
+        }
+        return 0;
+    }
+
+    lock_ref.handoff.store(0, Ordering::Relaxed);
     lock_ref.data.store(0, Ordering::Release);
     0
 }
@@ -420,6 +753,7 @@ redhook::hook! {
             Ok(l) => l,
             Err(e) => return e,
         };
+
         spinpark_cond_wait(cond_obj, lock_obj, ptr::null::<timespec>())
     }
 }
@@ -430,6 +764,10 @@ redhook::hook! {
         mutex: *mut pthread_mutex_t,
         abstime: *const timespec
     ) -> c_int => my_pthread_cond_timedwait {
+        if abstime.is_null() {
+            return libc::EINVAL;
+        }
+
         let cond_obj = match get_or_init_cond(cond, true) {
             Ok(c) => c,
             Err(e) => return e,
@@ -438,6 +776,7 @@ redhook::hook! {
             Ok(l) => l,
             Err(e) => return e,
         };
+
         spinpark_cond_wait(cond_obj, lock_obj, abstime)
     }
 }

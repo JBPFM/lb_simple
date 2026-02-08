@@ -6,7 +6,11 @@
 #define __kptr
 #endif
 
-#define VIP_DSQ_ID 1
+#define VIP_DSQ_BASE 1ULL
+#define VIP_DSQ_SLOTS 4096U
+#define VIP_DSQ_LAST (VIP_DSQ_BASE + VIP_DSQ_SLOTS - 1ULL)
+#define VIP_MAX_CPUS 256U
+#define VIP_DSQ_ID(slot) (VIP_DSQ_BASE + (unsigned long long)(slot))
 
 enum yield_reason {
     YIELD_NONE            = 0,
@@ -14,11 +18,11 @@ enum yield_reason {
     YIELD_LOCK_HANDOFF    = 2,
 };
 
-/* 存储在用户空间 thread-local 中，BPF 通过 bpf_probe_read_user 读取 */
+/* Stored in user thread-local memory and sampled from BPF. */
 struct task_yield_info {
-    unsigned int reason;           /* enum yield_reason */
-    unsigned int gen;              /* 代数计数器，每次 yield 递增 */
-    unsigned long long lock_addr;
+    unsigned int reason; /* enum yield_reason */
+    unsigned int gen;    /* seqcount: odd=writer active, even=committed */
+    unsigned long long vip_dsq_id;
 };
 
 struct held_lock_info {
