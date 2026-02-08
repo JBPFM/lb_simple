@@ -69,18 +69,20 @@ impl Drop for SchedulerState {
     fn drop(&mut self) {
         let stats = yield_stats_snapshot();
         info!(
-            "yield stats: lock_acquire={} contention_yield={} handoff_yield={} fallback_yield={} handoff_taken={} handoff_miss={}",
+            "yield stats: lock_acquire={} contention_yield={} requeue_yield={} handoff_yield={} fallback_yield={} handoff_taken={} handoff_miss={}",
             stats.lock_acquire,
             stats.contention_yield,
+            stats.requeue_yield,
             stats.handoff_yield,
             stats.fallback_yield,
             stats.handoff_taken,
             stats.handoff_miss
         );
         eprintln!(
-            "[lb_simple] yield stats: lock_acquire={} contention_yield={} handoff_yield={} fallback_yield={} handoff_taken={} handoff_miss={}",
+            "[lb_simple] yield stats: lock_acquire={} contention_yield={} requeue_yield={} handoff_yield={} fallback_yield={} handoff_taken={} handoff_miss={}",
             stats.lock_acquire,
             stats.contention_yield,
+            stats.requeue_yield,
             stats.handoff_yield,
             stats.fallback_yield,
             stats.handoff_taken,
@@ -138,9 +140,10 @@ static FINI: extern "C" fn() = {
     extern "C" fn fini() {
         let stats = yield_stats_snapshot();
         eprintln!(
-            "[lb_simple] yield stats: lock_acquire={} contention_yield={} handoff_yield={} fallback_yield={} handoff_taken={} handoff_miss={}",
+            "[lb_simple] yield stats: lock_acquire={} contention_yield={} requeue_yield={} handoff_yield={} fallback_yield={} handoff_taken={} handoff_miss={}",
             stats.lock_acquire,
             stats.contention_yield,
+            stats.requeue_yield,
             stats.handoff_yield,
             stats.fallback_yield,
             stats.handoff_taken,

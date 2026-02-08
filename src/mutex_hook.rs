@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering, 
 use std::thread::yield_now;
 
 const SPINPARK_SPIN_TIME: u32 = 128;
+const SPINPARK_WAIT_SPIN_TIME: u32 = 4096;
 
 const OBJ_UNINIT: u32 = 0;
 const OBJ_INITING: u32 = 1;
@@ -24,6 +25,10 @@ const OBJ_READY: u32 = 2;
 const YIELD_NONE: u32 = 0;
 const YIELD_LOCK_CONTENTION: u32 = 1;
 const YIELD_LOCK_HANDOFF: u32 = 2;
+const LOCK_STATE_UNLOCKED: u32 = 0;
+const LOCK_STATE_LOCKED: u32 = 1;
+const LOCK_STATE_QUEUED: u32 = 2;
+const HANDOFF_RETRY_MAX: u32 = 8;
 const VIP_DSQ_BASE: u64 = 1;
 const VIP_DSQ_SLOTS: u32 = 4096;
 const VIP_DSQ_LAST: u64 = VIP_DSQ_BASE + (VIP_DSQ_SLOTS as u64) - 1;
@@ -38,6 +43,7 @@ static TLS_CLEANUP_KEY: OnceLock<pthread_key_t> = OnceLock::new();
 static NEXT_VIP_SLOT: AtomicU32 = AtomicU32::new(0);
 static LOCK_ACQUIRE_CNT: AtomicU64 = AtomicU64::new(0);
 static YIELD_CONTENTION_CNT: AtomicU64 = AtomicU64::new(0);
+static YIELD_REQUEUE_CNT: AtomicU64 = AtomicU64::new(0);
 static YIELD_HANDOFF_CNT: AtomicU64 = AtomicU64::new(0);
 static YIELD_FALLBACK_CNT: AtomicU64 = AtomicU64::new(0);
 static HANDOFF_TAKEN_CNT: AtomicU64 = AtomicU64::new(0);
@@ -47,6 +53,7 @@ static HANDOFF_MISS_CNT: AtomicU64 = AtomicU64::new(0);
 pub(crate) struct YieldStatsSnapshot {
     pub lock_acquire: u64,
     pub contention_yield: u64,
+    pub requeue_yield: u64,
     pub handoff_yield: u64,
     pub fallback_yield: u64,
     pub handoff_taken: u64,
@@ -57,6 +64,7 @@ pub(crate) fn yield_stats_snapshot() -> YieldStatsSnapshot {
     YieldStatsSnapshot {
         lock_acquire: LOCK_ACQUIRE_CNT.load(Ordering::Relaxed),
         contention_yield: YIELD_CONTENTION_CNT.load(Ordering::Relaxed),
+        requeue_yield: YIELD_REQUEUE_CNT.load(Ordering::Relaxed),
         handoff_yield: YIELD_HANDOFF_CNT.load(Ordering::Relaxed),
         fallback_yield: YIELD_FALLBACK_CNT.load(Ordering::Relaxed),
         handoff_taken: HANDOFF_TAKEN_CNT.load(Ordering::Relaxed),
@@ -78,7 +86,7 @@ struct CondAs {
 
 #[repr(C)]
 struct SpinparkLock {
-    // 0: unlocked, 1: locked.
+    // 0: unlocked, 1: locked, 2: locked with queued waiters.
     data: AtomicU32,
     // 0: no handoff in progress, 1: unlock yielded for a waiter handoff.
     handoff: AtomicU32,
@@ -297,6 +305,72 @@ fn strong_handoff_enabled(lock_ref: &SpinparkLock) -> bool {
 }
 
 #[inline]
+fn mark_contended(lock_ref: &SpinparkLock) {
+    let _ = lock_ref.data.compare_exchange(
+        LOCK_STATE_LOCKED,
+        LOCK_STATE_QUEUED,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+}
+
+#[inline]
+fn dec_waiters(lock_ref: &SpinparkLock) -> u32 {
+    loop {
+        let cur = lock_ref.waiters.load(Ordering::Acquire);
+        if cur == 0 {
+            return 0;
+        }
+
+        if lock_ref
+            .waiters
+            .compare_exchange_weak(cur, cur - 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return cur - 1;
+        }
+    }
+}
+
+#[inline]
+fn settle_post_acquire(lock_ref: &SpinparkLock, waiter_accounted: &mut bool) {
+    if !*waiter_accounted {
+        return;
+    }
+
+    let remaining = dec_waiters(lock_ref);
+    if remaining > 0 {
+        lock_ref.data.store(LOCK_STATE_QUEUED, Ordering::Release);
+    } else {
+        lock_ref.data.store(LOCK_STATE_LOCKED, Ordering::Release);
+    }
+    *waiter_accounted = false;
+}
+
+#[inline]
+fn try_consume_handoff(lock_ref: &SpinparkLock, waiter_accounted: &mut bool) -> bool {
+    if lock_ref
+        .handoff
+        .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+
+    if *waiter_accounted {
+        settle_post_acquire(lock_ref, waiter_accounted);
+    } else if lock_ref.waiters.load(Ordering::Acquire) == 0 {
+        lock_ref.data.store(LOCK_STATE_LOCKED, Ordering::Release);
+    } else {
+        lock_ref.data.store(LOCK_STATE_QUEUED, Ordering::Release);
+    }
+
+    HANDOFF_TAKEN_CNT.fetch_add(1, Ordering::Relaxed);
+    LOCK_ACQUIRE_CNT.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+#[inline]
 fn mutex_layout_ok() -> bool {
     size_of::<pthread_mutex_t>() >= size_of::<LockAs>()
         && align_of::<pthread_mutex_t>() >= align_of::<LockAs>()
@@ -357,7 +431,7 @@ fn get_or_init_lock(mutex: *mut pthread_mutex_t, create: bool) -> Result<*mut Sp
                 };
                 if won.is_ok() {
                     let lock = Box::new(SpinparkLock {
-                        data: AtomicU32::new(0),
+                        data: AtomicU32::new(LOCK_STATE_UNLOCKED),
                         handoff: AtomicU32::new(0),
                         waiters: AtomicU32::new(0),
                         vip_dsq_id: alloc_vip_dsq_id(),
@@ -496,7 +570,12 @@ fn spinpark_trylock(lock: *mut SpinparkLock) -> c_int {
     let lock_ref = unsafe { &*lock };
     if lock_ref
         .data
-        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .compare_exchange(
+            LOCK_STATE_UNLOCKED,
+            LOCK_STATE_LOCKED,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        )
         .is_ok()
     {
         LOCK_ACQUIRE_CNT.fetch_add(1, Ordering::Relaxed);
@@ -509,21 +588,41 @@ fn spinpark_trylock(lock: *mut SpinparkLock) -> c_int {
 fn spinpark_lock(lock: *mut SpinparkLock) {
     let lock_ref = unsafe { &*lock };
     let mut spin_count = 0u32;
+    let mut waiter_accounted = false;
 
     loop {
         // TTAS: only attempt RMW when lock looks free.
-        if lock_ref.data.load(Ordering::Relaxed) == 0
+        if lock_ref.data.load(Ordering::Relaxed) == LOCK_STATE_UNLOCKED
             && lock_ref
                 .data
-                .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .compare_exchange_weak(
+                    LOCK_STATE_UNLOCKED,
+                    LOCK_STATE_LOCKED,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                )
                 .is_ok()
         {
+            settle_post_acquire(lock_ref, &mut waiter_accounted);
             LOCK_ACQUIRE_CNT.fetch_add(1, Ordering::Relaxed);
             return;
         }
 
+        if waiter_accounted
+            && strong_handoff_enabled(lock_ref)
+            && lock_ref.data.load(Ordering::Acquire) == LOCK_STATE_QUEUED
+            && try_consume_handoff(lock_ref, &mut waiter_accounted)
+        {
+            return;
+        }
+
         spin_count = spin_count.wrapping_add(1);
-        if spin_count < SPINPARK_SPIN_TIME {
+        let spin_limit = if waiter_accounted {
+            SPINPARK_WAIT_SPIN_TIME
+        } else {
+            SPINPARK_SPIN_TIME
+        };
+        if spin_count < spin_limit {
             spin_loop();
             continue;
         }
@@ -536,41 +635,47 @@ fn spinpark_lock(lock: *mut SpinparkLock) {
             continue;
         }
 
-        // Declare waiter once per park and avoid losing handoff if unlock won the
-        // race before we reached sched_yield().
-        lock_ref.waiters.fetch_add(1, Ordering::AcqRel);
-        if lock_ref.data.load(Ordering::Acquire) == 0
+        // Mark lock as queued before parking.
+        mark_contended(lock_ref);
+
+        // Declare waiter once per lock attempt; keep it accounted across retries.
+        let first_park = !waiter_accounted;
+        if !waiter_accounted {
+            lock_ref.waiters.fetch_add(1, Ordering::AcqRel);
+            waiter_accounted = true;
+        }
+        if lock_ref.data.load(Ordering::Acquire) == LOCK_STATE_UNLOCKED
             && lock_ref
                 .data
-                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .compare_exchange(
+                    LOCK_STATE_UNLOCKED,
+                    LOCK_STATE_LOCKED,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                )
                 .is_ok()
         {
-            lock_ref.waiters.fetch_sub(1, Ordering::Release);
+            settle_post_acquire(lock_ref, &mut waiter_accounted);
             LOCK_ACQUIRE_CNT.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        if try_consume_handoff(lock_ref, &mut waiter_accounted) {
             return;
         }
 
         ensure_registered();
         set_yield_info(YIELD_LOCK_CONTENTION, lock_ref.vip_dsq_id);
-        YIELD_CONTENTION_CNT.fetch_add(1, Ordering::Relaxed);
+        if first_park {
+            YIELD_CONTENTION_CNT.fetch_add(1, Ordering::Relaxed);
+        } else {
+            YIELD_REQUEUE_CNT.fetch_add(1, Ordering::Relaxed);
+        }
         unsafe { libc::sched_yield() };
 
-        /*
-         * Correctness first: resumed task may come from generic yield paths.
-         * Treat handoff as acquired only when we consume handoff == 1.
-         */
-        if lock_ref
-            .handoff
-            .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            lock_ref.waiters.fetch_sub(1, Ordering::Release);
-            HANDOFF_TAKEN_CNT.fetch_add(1, Ordering::Relaxed);
-            LOCK_ACQUIRE_CNT.fetch_add(1, Ordering::Relaxed);
+        if try_consume_handoff(lock_ref, &mut waiter_accounted) {
             return;
         }
-
-        lock_ref.waiters.fetch_sub(1, Ordering::Release);
         spin_count = 0;
     }
 }
@@ -578,28 +683,49 @@ fn spinpark_lock(lock: *mut SpinparkLock) {
 #[inline]
 fn spinpark_unlock(lock: *mut SpinparkLock) -> c_int {
     let lock_ref = unsafe { &*lock };
+    let state = lock_ref.data.load(Ordering::Acquire);
 
-    if strong_handoff_enabled(lock_ref) && lock_ref.waiters.load(Ordering::Acquire) != 0 {
+    if state == LOCK_STATE_LOCKED {
+        lock_ref.handoff.store(0, Ordering::Relaxed);
+        lock_ref.data.store(LOCK_STATE_UNLOCKED, Ordering::Release);
+        return 0;
+    }
+
+    if state == LOCK_STATE_QUEUED
+        && strong_handoff_enabled(lock_ref)
+        && lock_ref.waiters.load(Ordering::Acquire) != 0
+    {
         ensure_registered();
-        lock_ref.handoff.store(1, Ordering::Release);
-        set_yield_info(YIELD_LOCK_HANDOFF, lock_ref.vip_dsq_id);
-        YIELD_HANDOFF_CNT.fetch_add(1, Ordering::Relaxed);
-        unsafe { libc::sched_yield() };
+        for _ in 0..HANDOFF_RETRY_MAX {
+            lock_ref.handoff.store(1, Ordering::Release);
+            set_yield_info(YIELD_LOCK_HANDOFF, lock_ref.vip_dsq_id);
+            YIELD_HANDOFF_CNT.fetch_add(1, Ordering::Relaxed);
+            unsafe { libc::sched_yield() };
 
-        // If nobody consumed handoff, release lock normally.
-        if lock_ref
-            .handoff
-            .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            HANDOFF_MISS_CNT.fetch_add(1, Ordering::Relaxed);
-            lock_ref.data.store(0, Ordering::Release);
+            /*
+             * compare_exchange() succeeds only when value is still 1, meaning
+             * no waiter consumed this handoff.
+             */
+            if lock_ref
+                .handoff
+                .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return 0;
+            }
+
+            if lock_ref.waiters.load(Ordering::Acquire) == 0 {
+                break;
+            }
         }
+
+        HANDOFF_MISS_CNT.fetch_add(1, Ordering::Relaxed);
+        lock_ref.data.store(LOCK_STATE_UNLOCKED, Ordering::Release);
         return 0;
     }
 
     lock_ref.handoff.store(0, Ordering::Relaxed);
-    lock_ref.data.store(0, Ordering::Release);
+    lock_ref.data.store(LOCK_STATE_UNLOCKED, Ordering::Release);
     0
 }
 

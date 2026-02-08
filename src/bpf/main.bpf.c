@@ -129,6 +129,11 @@ bool BPF_STRUCT_OPS(lb_simple_yield, struct task_struct *from,
             return false;
         }
 
+        if (scx_bpf_dsq_move_to_local(uinfo.vip_dsq_id)) {
+            entry->bpf_reason = YIELD_NONE;
+            return true;
+        }
+
         cpu_slot = vip_cpu_slot(bpf_get_smp_processor_id());
         hint = bpf_map_lookup_elem(&handoff_hint_map, &cpu_slot);
         if (hint) {
