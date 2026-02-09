@@ -11,11 +11,11 @@ use std::cmp::Ordering as CmpOrdering;
 use std::hint::spin_loop;
 use std::mem::{align_of, size_of};
 use std::ptr;
+use std::sync::atomic::{fence, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
 use std::thread::yield_now;
 
-const SPINPARK_SPIN_TIME: u32 = 128;
+const SPINPARK_SPIN_TIME: u32 = 256;
 const SPINPARK_WAIT_SPIN_TIME: u32 = 4096;
 
 const OBJ_UNINIT: u32 = 0;
@@ -28,7 +28,7 @@ const YIELD_LOCK_HANDOFF: u32 = 2;
 const LOCK_STATE_UNLOCKED: u32 = 0;
 const LOCK_STATE_LOCKED: u32 = 1;
 const LOCK_STATE_QUEUED: u32 = 2;
-const HANDOFF_RETRY_MAX: u32 = 8;
+const HANDOFF_RETRY_MAX: u32 = 1;
 const VIP_DSQ_BASE: u64 = 1;
 const VIP_DSQ_SLOTS: u32 = 4096;
 const VIP_DSQ_LAST: u64 = VIP_DSQ_BASE + (VIP_DSQ_SLOTS as u64) - 1;
@@ -267,6 +267,14 @@ fn ensure_registered() {
             });
         });
     });
+}
+
+#[inline]
+fn is_registered_fast() -> bool {
+    if REGISTERED.with(|registered| registered.get()) {
+        return true;
+    }
+    YIELD_ADDR_MAP_FD.load(Ordering::Acquire) >= 0 && REGISTERED.with(|registered| registered.get())
 }
 
 #[inline]
@@ -664,7 +672,9 @@ fn spinpark_lock(lock: *mut SpinparkLock) {
             return;
         }
 
-        ensure_registered();
+        if !is_registered_fast() {
+            ensure_registered();
+        }
         set_yield_info(YIELD_LOCK_CONTENTION, lock_ref.vip_dsq_id);
         if first_park {
             YIELD_CONTENTION_CNT.fetch_add(1, Ordering::Relaxed);
@@ -695,7 +705,9 @@ fn spinpark_unlock(lock: *mut SpinparkLock) -> c_int {
         && strong_handoff_enabled(lock_ref)
         && lock_ref.waiters.load(Ordering::Acquire) != 0
     {
-        ensure_registered();
+        if !is_registered_fast() {
+            ensure_registered();
+        }
         for _ in 0..HANDOFF_RETRY_MAX {
             lock_ref.handoff.store(1, Ordering::Release);
             set_yield_info(YIELD_LOCK_HANDOFF, lock_ref.vip_dsq_id);
