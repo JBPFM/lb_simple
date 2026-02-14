@@ -9,8 +9,25 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 BT_SCRIPT="$SCRIPT_DIR/hypothesis_delayed_wakeup.bt"
 RESULTS_DIR="$SCRIPT_DIR/hypothesis_results"
-DB_BENCH="/mnt/home/jz/test/test/leveldb/build/db_bench"
 LB_SIMPLE_LIB="$PROJECT_DIR/target/release/liblb_simple.so"
+
+default_db_bench() {
+    local candidates=(
+        "$PROJECT_DIR/bench/flexguard/ext/leveldb-1.20/out-static/db_bench"
+        "$PROJECT_DIR/bench/flexguard/ext/leveldb-1.20/out-shared/db_bench"
+        "$PROJECT_DIR/bench/flexguard/ext/leveldb/build/db_bench"
+    )
+    local path
+    for path in "${candidates[@]}"; do
+        if [[ -x "$path" ]]; then
+            printf "%s\n" "$path"
+            return
+        fi
+    done
+    printf "%s\n" "${candidates[0]}"
+}
+
+DB_BENCH="${DB_BENCH:-$(default_db_bench)}"
 
 THREADS=80
 OPS=500000
@@ -55,6 +72,12 @@ run_test() {
 if [ ! -f "$LB_SIMPLE_LIB" ]; then
     echo "编译 liblb_simple.so..."
     cd "$PROJECT_DIR" && cargo build --release
+fi
+
+if [[ ! -x "$DB_BENCH" ]]; then
+    echo "错误: db_bench 未找到或不可执行: $DB_BENCH"
+    echo "请先在 bench/flexguard 下构建 leveldb。"
+    exit 1
 fi
 
 # 运行测试

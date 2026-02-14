@@ -61,7 +61,7 @@ sudo LD_PRELOAD="$PWD/target/release/liblb_simple.so" <命令> [参数...]
 
 ```bash
 sudo LD_PRELOAD="$PWD/target/release/liblb_simple.so" taskset -c 0 \
-  ~/test/test/leveldb/build/db_bench \
+  "$PWD/bench/flexguard/ext/leveldb-1.20/out-static/db_bench" \
   --benchmarks=readrandom --threads=80 --num=50000
 ```
 
